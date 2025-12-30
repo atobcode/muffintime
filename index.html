@@ -1,0 +1,32 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Start IPCP 418 Monitor</title>
+  <style>body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial;max-width:800px;margin:40px auto;padding:0 16px}button{padding:8px 12px;font-size:16px}</style>
+</head>
+<body>
+  <h1>Start IPCP 418 Monitor</h1>
+  <p>This page performs a simple HTTP GET to the configured target URL and displays the HTTP status code. It does not run the server-side monitor (main.py) — it only checks the public HTTP endpoint.</p>
+  <label>Target URL: <input id="url" value="https://fox-towing.com/contact-us" size="60"></label>
+  <p>
+    <button id="start">Start</button>
+    <a href="https://raw.githubusercontent.com/atobcode/muffintime/main/main.py" target="_blank" style="margin-left:12px">View main.py (raw)</a>
+  </p>
+  <pre id="output" style="white-space:pre-wrap;border:1px solid #ddd;padding:12px;background:#f9f9f9;min-height:80px"></pre>
+  <script>
+    document.getElementById('start').addEventListener('click', async function(){
+      const out = document.getElementById('output');
+      out.textContent = 'Requesting...';
+      try {
+        const url = document.getElementById('url').value;
+        const resp = await fetch(url, {method:'GET', mode:'cors'});
+        out.textContent = `HTTP ${resp.status}\n\n(If status is 418, the heartbeat returned.)`;
+      } catch (e) {
+        out.textContent = 'Error: ' + e + '\n\nNote: browsers may block cross-origin requests (CORS). Use curl or the server-side script for reliable checks.';
+      }
+    });
+  </script>
+</body>
+</html>
