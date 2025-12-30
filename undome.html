@@ -1,0 +1,895 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>undome bundle</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,monospace;max-width:1000px;margin:24px auto;padding:16px}
+    h2{margin-top:28px}
+    pre{background:#0f1720;color:#e6eef8;padding:12px;border-radius:6px;overflow:auto;white-space:pre-wrap}
+    .note{color:#444;margin:8px 0 20px}
+    .file-meta{font-size:13px;color:#666;margin-bottom:6px}
+  </style>
+</head>
+<body>
+
+<div class="note">Below is the bundled content converted to HTML. Secrets and environment-specific values are intentionally left as placeholders — do not commit real credentials to source control.</div>
+
+<h2>FILE: main.py</h2>
+<div class="file-meta">Nightly monitor: 22:00 → 06:00 UTC, rate-limited, one-shot no-show alert, self-exit on 418</div>
+<pre>#!/usr/bin/env python3
+"""
+main.py - IPCP 418 nightly monitor
+
+Behavior:
+ - Runs only during the test window START_HOUR -> STOP_HOUR (defaults 22 -> 6).
+ - Enforces a rolling MAX_HITS per WINDOW_HOURS (defaults 420 per 12h).
+ - Sends a one-time "no-show" alert after ALERT_AFTER seconds if 418 has not been seen.
+ - On seeing HTTP 418, sends an alert (email and optional SMS-via-email), saves last_response.html and exits.
+ - Exits automatically at STOP_HOUR each night.
+
+Environment variables (examples / defaults):
+ - TARGET_URL="https://fox-towing.com/contact-us"
+ - START_HOUR=22
+ - STOP_HOUR=6
+ - ALERT_AFTER=180
+ - POLL_INTERVAL=60
+ - TIMEOUT=10
+ - MAX_HITS=420
+ - WINDOW_HOURS=12
+ - HITS_FILE=/var/lib/ipcp-monitor/hits.log
+ - TO_EMAIL=foxtowing2021@gmail.com
+ - SMS_TO=
+ - SMTP_HOST=smtp.example.com
+ - SMTP_PORT=587
+ - SMTP_USER=
+ - SMTP_PASS=
+ - SMTP_FROM=monitor@localhost
+"""
+import os
+import time
+import urllib.request
+import urllib.error
+import smtplib
+from email.message import EmailMessage
+from datetime import datetime
+from collections import deque
+import sys
+
+# Configuration from environment
+TARGET_URL = os.getenv("TARGET_URL", "https://fox-towing.com/contact-us")
+START_HOUR = int(os.getenv("START_HOUR", "22"))
+STOP_HOUR = int(os.getenv("STOP_HOUR", "6"))
+ALERT_AFTER = int(os.getenv("ALERT_AFTER", "180"))  # seconds; 0 disables no-show alert
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "60"))
+TIMEOUT = float(os.getenv("TIMEOUT", "10"))
+
+MAX_HITS = int(os.getenv("MAX_HITS", "420"))
+WINDOW_HOURS = float(os.getenv("WINDOW_HOURS", "12"))
+WINDOW_SEC = WINDOW_HOURS * 3600.0
+HITS_FILE = os.getenv("HITS_FILE", "hits.log")
+
+TO_EMAIL = os.getenv("TO_EMAIL", "foxtowing2021@gmail.com")
+SMS_TO = os.getenv("SMS_TO", "")  # optional: an email-to-SMS address (carrier gateway)
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.example.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER or "monitor@localhost")
+
+# Helpers: time window checks
+def now_hour():
+    return datetime.utcnow().hour  # use UTC for scheduling consistency
+
+def in_test_window(start_hour: int, stop_hour: int) -> bool:
+    h = now_hour()
+    if start_hour == stop_hour:
+        return True  # all day
+    if start_hour < stop_hour:
+        return start_hour <= h < stop_hour
+    # overnight window (e.g., 22 -> 6)
+    return h >= start_hour or h < stop_hour
+
+# Persistent hit storage
+def load_hits(path: str, window_sec: float):
+    now = time.time()
+    hits = deque()
+    if not os.path.exists(path):
+        return hits
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for ln in fh:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    ts = float(ln)
+                except Exception:
+                    continue
+                if ts >= now - window_sec:
+                    hits.append(ts)
+    except Exception:
+        return deque()
+    return hits
+
+def persist_hit(path: str, ts: float):
+    try:
+        d = os.path.dirname(path)
+        if d and not os.path.exists(d):
+            os.makedirs(d, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"{ts}\n")
+    except Exception:
+        pass
+
+def prune_hits(hits: deque, window_sec: float):
+    now = time.time()
+    cutoff = now - window_sec
+    while hits and hits[0] < cutoff:
+        hits.popleft()
+
+def ensure_rate_allowance(hits: deque, max_hits: int, window_sec: float):
+    while True:
+        prune_hits(hits, window_sec)
+        if len(hits) < max_hits:
+            return
+        earliest = hits[0]
+        next_allowed = earliest + window_sec
+        now = time.time()
+        sleep_for = max(1.0, next_allowed - now)
+        eta = datetime.utcfromtimestamp(now + sleep_for).isoformat() + "Z"
+        print(f"[RATE LIMIT] {len(hits)} hits in window >= {max_hits}. Sleeping {int(sleep_for)}s until {eta}")
+        time.sleep(sleep_for)
+
+# HTTP fetch
+def fetch(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "ipcp-monitor/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            return r.getcode(), r.read().decode(errors="replace")
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode(errors="replace")
+        except Exception:
+            body = ""
+        return e.code, body
+    except Exception:
+        return None, ""
+
+# Email send (STARTTLS + LOGIN)
+def send_via_smtp(host, port, user, passwd, mail_from, mail_to, subject, body):
+    msg = EmailMessage()
+    msg["From"] = mail_from
+    msg["To"] = mail_to
+    msg["Subject"] = subject
+    msg.set_content(body)
+    try:
+        with smtplib.SMTP(host, port, timeout=15) as s:
+            s.ehlo()
+            s.starttls()
+            s.ehlo()
+            if user and passwd:
+                s.login(user, passwd)
+            s.send_message(msg)
+        return True
+    except Exception as e:
+        print("[EMAIL ERROR]", e)
+        return False
+
+def notify(subject: str, body: str):
+    # Send to main email
+    ok = send_via_smtp(SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM, TO_EMAIL, subject, body)
+    if SMS_TO:
+        # send same body to SMS gateway address (best-effort)
+        send_via_smtp(SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM, SMS_TO, subject, body)
+    return ok
+
+def save_html(text: str):
+    try:
+        with open("last_response.html", "w", encoding="utf-8") as fh:
+            fh.write(text or "")
+    except Exception:
+        pass
+
+def should_stop_by_time(start_hour: int, stop_hour: int) -> bool:
+    # Called periodically to decide if we reached stop time and should exit
+    return not in_test_window(start_hour, stop_hour)
+
+def iso_now():
+    return datetime.utcnow().isoformat() + "Z"
+
+def main():
+    # If invoked outside the window, exit immediately
+    if not in_test_window(START_HOUR, STOP_HOUR):
+        print(f"[INFO] Current UTC hour {now_hour()} is outside the test window {START_HOUR}->{STOP_HOUR}. Exiting.")
+        return 0
+
+    hits = load_hits(HITS_FILE, WINDOW_SEC)
+    start_ts = time.time()
+    alerted_no418 = False
+
+    print(f"[INFO] Starting monitor for {TARGET_URL} between {START_HOUR}:00 and {STOP_HOUR}:00 UTC")
+    print(f"[INFO] Rate limit: {MAX_HITS} hits per {WINDOW_HOURS} hours. ALERT_AFTER={ALERT_AFTER}s")
+
+    while True:
+        # If stop time reached while running, exit gracefully
+        if should_stop_by_time(START_HOUR, STOP_HOUR):
+            print(f"[INFO] Reached stop time (UTC hour {now_hour()}). Exiting monitor.")
+            return 0
+
+        # Rate-limit enforcement
+        ensure_rate_allowance(hits, MAX_HITS, WINDOW_SEC)
+
+        # Record hit immediately
+        ts = time.time()
+        hits.append(ts)
+        persist_hit(HITS_FILE, ts)
+
+        code, body = fetch(TARGET_URL)
+        now = iso_now()
+        print(f"[{now}] status={code} (hits_in_window={len(hits)})")
+
+        # If 418 observed: notify, save HTML, self-kill (exit)
+        if code == 418:
+            snippet = (body or "").replace("\\n", " ")[:1000]
+            subject = f"[ALERT] {TARGET_URL} returned 418"
+            body_txt = f"Target: {TARGET_URL}\\nStatus: 418\\nTime (UTC): {now}\\n\\nSnippet:\\n{snippet}\\n\\nMonitor will now exit for pro intervention."
+            notify(subject, body_txt)
+            save_html(body or "")
+            print("[SENT] 418 alert sent. Exiting (self-kill) for pro handoff.")
+            return 0
+
+        # If no-418 alert configured and time elapsed, send one-time "no-show" notification
+        if ALERT_AFTER > 0 and not alerted_no418:
+            elapsed = time.time() - start_ts
+            if elapsed >= ALERT_AFTER:
+                snippet = (body or "").replace("\\n", " ")[:1000]
+                subject = f"[ALERT] {TARGET_URL} - no 418 observed after {ALERT_AFTER}s"
+                body_txt = f"Target: {TARGET_URL}\\nTime (UTC): {now}\\nElapsed without 418: {int(elapsed)}s\\n\\nLast seen status: {code}\\n\\nLast snippet:\\n{snippet}"
+                notify(subject, body_txt)
+                print("[SENT] no-show alert sent.")
+                alerted_no418 = True
+
+        # Sleep until next poll, but wake up earlier if the stop time hits
+        sleep_total = POLL_INTERVAL
+        slept = 0.0
+        while slept < sleep_total:
+            if should_stop_by_time(START_HOUR, STOP_HOUR):
+                print(f"[INFO] stop time reached during sleep. Exiting.")
+                return 0
+            to_sleep = min(5.0, sleep_total - slept)
+            time.sleep(to_sleep)
+            slept += to_sleep
+
+if __name__ == "__main__":
+    try:
+        rc = main() or 0
+        sys.exit(rc)
+    except Exception as exc:
+        print("[FATAL ERROR]", exc)
+        sys.exit(2)
+</pre>
+
+<h2>FILE: main_smtp.py</h2>
+<div class="file-meta">SMTP STARTTLS + auth variant</div>
+<pre>#!/usr/bin/env python3
+"""
+main_smtp.py - SMTP STARTTLS + LOGIN capable monitor variant.
+Usage: configure via env vars as documented previously.
+"""
+import os, time, urllib.request, urllib.error, smtplib
+from email.message import EmailMessage
+from datetime import datetime
+from collections import deque
+
+URL = os.getenv("TARGET_URL", "https://fox-towing.com/contact-us")
+TO = os.getenv("TO_EMAIL", "foxtowing2021@gmail.com")
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.example.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER or "scanner@localhost")
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "60"))
+TIMEOUT = float(os.getenv("TIMEOUT", "10"))
+ALERT_AFTER = int(os.getenv("ALERT_AFTER", "180"))  # default 3 minutes alert if desired
+
+MAX_HITS = int(os.getenv("MAX_HITS", "420"))
+WINDOW_HOURS = float(os.getenv("WINDOW_HOURS", "12"))
+WINDOW_SEC = WINDOW_HOURS * 3600.0
+HITS_FILE = os.getenv("HITS_FILE", "hits.log")
+
+def load_hits(path, window_sec):
+    now = time.time(); hits = deque()
+    if not os.path.exists(path): return hits
+    try:
+        with open(path,"r",encoding="utf-8") as fh:
+            for ln in fh:
+                try:
+                    ts = float(ln.strip())
+                except: continue
+                if ts >= now - window_sec: hits.append(ts)
+    except: return deque()
+    return hits
+
+def persist_hit(path, ts):
+    try:
+        with open(path,"a",encoding="utf-8") as fh: fh.write(f"{ts}\n")
+    except: pass
+
+def prune_hits(hits, window_sec):
+    now = time.time(); cutoff = now - window_sec
+    while hits and hits[0] < cutoff: hits.popleft()
+
+def ensure_rate_allowance(hits, max_hits, window_sec):
+    while True:
+        prune_hits(hits, window_sec)
+        if len(hits) < max_hits: return
+        earliest = hits[0]; next_allowed = earliest + window_sec
+        now = time.time(); sleep_for = max(1.0, next_allowed - now)
+        eta = datetime.utcfromtimestamp(now + sleep_for__).isoformat() + "Z"
+        print(f"[RATE LIMIT] {len(hits)} hits in window >= {max_hits}. Sleeping {int(sleep_for)}s until {eta}")
+        time.sleep(sleep_for)
+
+def fetch(url):
+    req = urllib.request.Request(url, headers={"User-Agent":"ipcp-monitor/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            return r.getcode(), r.read().decode(errors="replace")
+    except urllib.error.HTTPError as e:
+        try: body = e.read().decode(errors="replace")
+        except: body = ""
+        return e.code, body
+    except Exception:
+        return None, ""
+
+def send_email_starttls(host, port, user, passwd, mail_from, mail_to, subject, body):
+    msg = EmailMessage(); msg["From"]=mail_from; msg["To"]=mail_to; msg["Subject"]=subject; msg.set_content(body)
+    with smtplib.SMTP(host, port, timeout=15) as s:
+        s.ehlo(); s.starttls(); s.ehlo()
+        if user and passwd: s.login(user, passwd)
+        s.send_message(msg)
+
+def main():
+    hits = load_hits(HITS_FILE, WINDOW_SEC)
+    start_ts = time.time(); alerted_no418 = False
+    print(f"[INFO] {URL} -> notify {TO} (interval {POLL_INTERVAL}s) ALERT_AFTER={ALERT_AFTER}s MAX_HITS={MAX_HITS} window_hours={WINDOW_HOURS}")
+    while True:
+        ensure_rate_allowance(hits, MAX_HITS, WINDOW_SEC)
+        req_ts = time.time(); hits.append(req_ts); persist_hit(HITS_FILE, req_ts)
+        code, body = fetch(URL); now = datetime.utcnow().isoformat() + "Z"
+        print(f"[{now}] status={code} (hits_in_window={len(hits)})")
+        if code == 418:
+            snippet = (body or "").replace("\\n"," ")[:800]
+            subject = f"[ALERT] {URL} returned 418"
+            body_txt = f"Target: {URL}\\nStatus: 418\\nTime (UTC): {now}\\n\\nSnippet:\\n{snippet}"
+            try:
+                send_email_starttls(SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM, TO, subject, body_txt)
+                print("[SENT] notification email sent (418)")
+            except Exception as e:
+                print("[EMAIL ERROR]", e)
+            try:
+                with open("last_response.html","w",encoding="utf-8") as fh: fh.write(body or "")
+                print("[INFO] saved last_response.html")
+            except: pass
+            start_ts = time.time(); alerted_no418 = False
+        else:
+            if ALERT_AFTER > 0 and not alerted_no418:
+                elapsed = time.time() - start_ts
+                if elapsed >= ALERT_AFTER:
+                    snippet = (body or "").replace("\\n"," ")[:800]
+                    subject = f"[ALERT] {URL} - no 418 observed after {ALERT_AFTER}s"
+                    body_txt = f"Target: {URL}\\nStatus seen: {code}\\nTime (UTC): {now}\\nElapsed without 418: {int(elapsed)}s\\n\\nLast snippet:\\n{snippet}"
+                    try:
+                        send_email_starttls(SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM, TO, subject, body_txt)
+                        print("[SENT] notification email sent (no-418 alert)")
+                    except Exception as e:
+                        print("[EMAIL ERROR]", e)
+                    alerted_no418 = True
+        time.sleep(POLL_INTERVAL)
+
+if __name__ == "__main__":
+    main()
+</pre>
+
+<h2>FILE: control_server.py</h2>
+<div class="file-meta">Minimal token-protected control API to start/stop monitor on host</div>
+<pre>#!/usr/bin/env python3
+"""
+control_server.py - minimal control API for starting/stopping monitor.
+Usage:
+  CONTROL_TOKEN=your-secret-token python3 control_server.py
+Endpoints (POST):
+  /start  -> starts monitor (runs main_smtp.py)
+  /stop   -> stops monitor
+  /status -> returns running/stopped
+Note: run behind TLS / firewall and use a strong CONTROL_TOKEN.
+"""
+import os, subprocess, shlex, signal, time, json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+TOKEN = os.getenv("CONTROL_TOKEN")
+MONITOR_CMD = os.getenv("MONITOR_CMD", "python3 main_smtp.py")
+PORT = int(os.getenv("CONTROL_PORT", "8001"))
+
+proc = None
+
+class Handler(BaseHTTPRequestHandler):
+    def _auth_fail(self):
+        self.send_response(403); self.send_header("Content-Type","application/json"); self.end_headers()
+        self.wfile.write(b'{"error":"forbidden"}')
+
+    def do_POST(self):
+        global proc
+        token = self.headers.get("X-Auth-Token")
+        if not TOKEN or token != TOKEN:
+            return self._auth_fail()
+        path = self.path
+        if path == "/start":
+            if proc and proc.poll() is None:
+                self._write({"status":"running","pid":proc.pid})
+                return
+            proc = subprocess.Popen(shlex.split(MONITOR_CMD), stdout=open("monitor.log","a"), stderr=subprocess.STDOUT)
+            time.sleep(0.2)
+            self._write({"status":"started","pid":proc.pid})
+            return
+        if path == "/stop":
+            if not proc or proc.poll() is not None:
+                self._write({"status":"stopped"})
+                return
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+            self._write({"status":"stopped"})
+            return
+        if path == "/status":
+            running = bool(proc and proc.poll() is None)
+            self._write({"status":"running" if running else "stopped", "pid": proc.pid if running else None})
+            return
+        self.send_response(404); self.end_headers()
+
+    def _write(self, obj):
+        data = json.dumps(obj).encode("utf-8")
+        self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(data))); self.end_headers()
+        self.wfile.write(data)
+
+if __name__ == "__main__":
+    if not TOKEN:
+        print("Set CONTROL_TOKEN env var to a strong secret"); raise SystemExit(1)
+    server = HTTPServer(("127.0.0.1", PORT), Handler)
+    print(f"Control server listening on 127.0.0.1:{PORT}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        server.server_close()
+</pre>
+
+<h2>FILE: index.html</h2>
+<div class="file-meta">Simple browser UI (one-shot / poll). Note: CORS limits may apply.</div>
+<pre>&lt;!doctype html&gt;
+&lt;html&gt;
+&lt;head&gt;
+  &lt;meta charset="utf-8"&gt;
+  &lt;meta name="viewport" content="width=device-width,initial-scale=1"&gt;
+  &lt;title&gt;Start IPCP 418 Monitor&lt;/title&gt;
+  &lt;style&gt;
+    body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial;max-width:800px;margin:40px auto;padding:0 16px}
+    button{padding:8px 12px;font-size:16px}
+    input{width:70%}
+    .meta{color:#666;font-size:14px}
+  &lt;/style&gt;
+&lt;/head&gt;
+&lt;body&gt;
+  &lt;h1&gt;Start IPCP 418 Monitor&lt;/h1&gt;
+  &lt;p class="meta"&gt;This page performs a simple HTTP GET to the configured target URL and shows the HTTP status code. It does not run the server-side monitor (main.py)—use the script on a server for continuous monitoring.&lt;/p&gt;
+
+  &lt;label&gt;Target URL: &lt;input id="url" value="https://fox-towing.com/contact-us" placeholder="https://example.com/path"&gt;&lt;/label&gt;
+  &lt;p&gt;
+    &lt;button id="start"&gt;Start&lt;/button&gt;
+    &lt;button id="one"&gt;One-shot&lt;/button&gt;
+    &lt;a href="https://raw.githubusercontent.com/atobcode/muffintime/main/main.py" target="_blank" style="margin-left:12px"&gt;View main.py (raw)&lt;/a&gt;
+  &lt;/p&gt;
+
+  &lt;pre id="output" style="white-space:pre-wrap;border:1px solid #ddd;padding:12px;background:#f9f9f9;min-height:120px"&gt;&lt;/pre&gt;
+
+  &lt;script&gt;
+    async function checkOnce(url, outEl) {
+      outEl.textContent = 'Requesting ' + url + ' ...';
+      try {
+        const resp = await fetch(url, { method: 'GET', mode: 'cors', cache: 'no-store' });
+        outEl.textContent = `HTTP ${resp.status}\n\n(If status is 418, the heartbeat returned.)`;
+      } catch (err) {
+        outEl.textContent = 'Error: ' + err + '\n\nNote: cross-origin (CORS) restrictions may block browser checks; use curl or main.py for reliable polling.';
+      }
+    }
+
+    let polling = false, intervalId = null;
+    document.getElementById('start').addEventListener('click', function () {
+      const out = document.getElementById('output');
+      const url = document.getElementById('url').value.trim();
+      if (!url) { out.textContent = 'Please set a target URL.'; return; }
+      if (polling) {
+        polling = false;
+        clearInterval(intervalId);
+        this.textContent = 'Start';
+        out.textContent += '\n\nPolling stopped.';
+        return;
+      }
+      polling = true;
+      this.textContent = 'Stop';
+      out.textContent = 'Polling started. Press Stop to end.\n';
+      checkOnce(url, out);
+      intervalId = setInterval(() =&gt; checkOnce(url, out), 30000);
+    });
+
+    document.getElementById('one').addEventListener('click', function () {
+      const out = document.getElementById('output');
+      const url = document.getElementById('url').value.trim();
+      if (!url) { out.textContent = 'Please set a target URL.'; return; }
+      checkOnce(url, out);
+    });
+  &lt;/script&gt;
+&lt;/body&gt;
+&lt;/html&gt;
+</pre>
+
+<h2>FILES: PHP OAuth (google, github, twitch)</h2>
+<div class="file-meta">Place these in your web root. Set client IDs/secrets in env vars; use HTTPS and set provider redirect URIs accordingly.</div>
+
+<h3>config.php</h3>
+<pre>&lt;?php
+// config.php - reads provider client IDs/secrets and base app URL from environment vars.
+
+function app_base_url() {
+    $u = getenv('APP_URL');
+    if (!$u) {
+        $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+        $u = $scheme . '://' . $_SERVER['HTTP_HOST'];
+    }
+    return rtrim($u, '/');
+}
+
+function provider_config($name) {
+    $base = app_base_url();
+    $redirect = $base . '/callback.php?provider=' . $name;
+
+    $cfg = [
+        'google' => [
+            'client_id' => getenv('GOOGLE_CLIENT_ID') ?: '',
+            'client_secret' => getenv('GOOGLE_CLIENT_SECRET') ?: '',
+            'auth_url' => 'https://accounts.google.com/o/oauth2/v2/auth',
+            'token_url' => 'https://oauth2.googleapis.com/token',
+            'userinfo_url' => 'https://openidconnect.googleapis.com/v1/userinfo',
+            'scope' => 'openid email profile',
+            'redirect_uri' => $redirect,
+        ],
+        'github' => [
+            'client_id' => getenv('GITHUB_CLIENT_ID') ?: '',
+            'client_secret' => getenv('GITHUB_CLIENT_SECRET') ?: '',
+            'auth_url' => 'https://github.com/login/oauth/authorize',
+            'token_url' => 'https://github.com/login/oauth/access_token',
+            'userinfo_url' => 'https://api.github.com/user',
+            'scope' => 'read:user user:email',
+            'redirect_uri' => $redirect,
+        ],
+        'twitch' => [
+            'client_id' => getenv('TWITCH_CLIENT_ID') ?: '',
+            'client_secret' => getenv('TWITCH_CLIENT_SECRET') ?: '',
+            'auth_url' => 'https://id.twitch.tv/oauth2/authorize',
+            'token_url' => 'https://id.twitch.tv/oauth2/token',
+            'userinfo_url' => 'https://api.twitch.tv/helix/users',
+            'scope' => 'user:read:email',
+            'redirect_uri' => $redirect,
+        ],
+    ];
+
+    return $cfg[$name] ?? null;
+}
+</pre>
+
+<h3>index.php</h3>
+<pre>&lt;?php
+require_once __DIR__ . '/config.php';
+?&gt;
+&lt;!doctype html&gt;
+&lt;html&gt;
+&lt;head&gt;
+  &lt;meta charset="utf-8"&gt;
+  &lt;meta name="viewport" content="width=device-width,initial-scale=1"&gt;
+  &lt;title&gt;SSO – Sign in&lt;/title&gt;
+  &lt;style&gt;
+    body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial;max-width:920px;margin:36px auto;padding:0 18px}
+    .card{border:1px solid #e1e4e8;padding:24px;border-radius:8px;background:#fff}
+    h1{margin-top:0}
+    .btn{display:inline-block;padding:12px 18px;margin:8px;border-radius:6px;text-decoration:none;color:#fff}
+    .google{background:#0F9D58}
+    .github{background:#24292f}
+    .twitch{background:#6441A4}
+  &lt;/style&gt;
+&lt;/head&gt;
+&lt;body&gt;
+  &lt;div class="card"&gt;
+    &lt;h1&gt;Finish device reset — Sign in&lt;/h1&gt;
+    &lt;p&gt;Choose a provider to sign in with. After authorization the page will show a short confirmation and the provider identity. Make sure the OAuth app redirect URI is set to &lt;code&gt;&lt;?php echo htmlspecialchars(app_base_url() . '/callback.php'); ?&gt;&lt;/code&gt;.&lt;/p&gt;
+
+    &lt;p&gt;
+      &lt;a class="btn google" href="login.php?provider=google"&gt;Sign in with Google (Gemini)&lt;/a&gt;
+      &lt;a class="btn github" href="login.php?provider=github"&gt;Sign in with GitHub (Copilot)&lt;/a&gt;
+      &lt;a class="btn twitch" href="login.php?provider=twitch"&gt;Sign in with Twitch (Amazon)&lt;/a&gt;
+    &lt;/p&gt;
+
+    &lt;hr&gt;
+    &lt;p class="note"&gt;Notes: This server-side flow stores client secrets on the server (via environment variables). Do not commit secrets to your repo. Use HTTPS for the site.&lt;/p&gt;
+  &lt;/div&gt;
+&lt;/body&gt;
+&lt;/html&gt;
+</pre>
+
+<h3>login.php</h3>
+<pre>&lt;?php
+session_start();
+require_once __DIR__ . '/config.php';
+
+$provider = $_GET['provider'] ?? '';
+$cfg = provider_config($provider);
+if (!$cfg) {
+    http_response_code(400);
+    echo "Unknown provider";
+    exit;
+}
+
+$state = bin2hex(random_bytes(16));
+$_SESSION['oauth2_state'] = $state;
+$_SESSION['oauth2_provider'] = $provider;
+
+$params = [
+    'client_id' => $cfg['client_id'],
+    'redirect_uri' => $cfg['redirect_uri'],
+    'response_type' => 'code',
+    'scope' => $cfg['scope'],
+    'state' => $state,
+];
+
+$authUrl = $cfg['auth_url'] . '?' . http_build_query($params);
+header('Location: ' . $authUrl);
+exit;
+</pre>
+
+<h3>callback.php</h3>
+<pre>&lt;?php
+session_start();
+require_once __DIR__ . '/config.php';
+
+$provider = $_GET['provider'] ?? '';
+$cfg = provider_config($provider);
+if (!$cfg) {
+    http_response_code(400);
+    echo "Unknown provider";
+    exit;
+}
+
+if (empty($_GET['state']) || !isset($_SESSION['oauth2_state']) || $_GET['state'] !== $_SESSION['oauth2_state']) {
+    http_response_code(403);
+    echo "Invalid state (possible CSRF)";
+    exit;
+}
+
+if (isset($_GET['error'])) {
+    echo "Provider returned error: " . htmlspecialchars($_GET['error']);
+    exit;
+}
+
+$code = $_GET['code'] ?? null;
+if (!$code) {
+    http_response_code(400);
+    echo "Missing code";
+    exit;
+}
+
+$token = null;
+try {
+    if ($provider === 'google') {
+        $post = [
+            'code' => $code,
+            'client_id' => $cfg['client_id'],
+            'client_secret' => $cfg['client_secret'],
+            'redirect_uri' => $cfg['redirect_uri'],
+            'grant_type' => 'authorization_code',
+        ];
+        $resp = http_post_form($cfg['token_url'], $post, ['Accept: application/json']);
+        $data = json_decode($resp, true);
+        $token = $data['access_token'] ?? null;
+    } elseif ($provider === 'github') {
+        $post = [
+            'client_id' => $cfg['client_id'],
+            'client_secret' => $cfg['client_secret'],
+            'code' => $code,
+            'redirect_uri' => $cfg['redirect_uri'],
+            'state' => $_SESSION['oauth2_state'],
+        ];
+        $resp = http_post_form($cfg['token_url'], $post, ['Accept: application/json']);
+        $data = json_decode($resp, true);
+        $token = $data['access_token'] ?? null;
+    } elseif ($provider === 'twitch') {
+        $post = [
+            'client_id' => $cfg['client_id'],
+            'client_secret' => $cfg['client_secret'],
+            'code' => $code,
+            'grant_type' => 'authorization_code',
+            'redirect_uri' => $cfg['redirect_uri'],
+        ];
+        $resp = http_post_form($cfg['token_url'], $post, ['Accept: application/json']);
+        $data = json_decode($resp, true);
+        $token = $data['access_token'] ?? null;
+    } else {
+        throw new Exception("unsupported provider");
+    }
+} catch (Exception $e) {
+    echo "Token exchange failed: " . htmlspecialchars($e->getMessage());
+    exit;
+}
+
+if (!$token) {
+    echo "No access token returned.";
+    exit;
+}
+
+$user = null;
+try {
+    if ($provider === 'google') {
+        $resp = http_get($cfg['userinfo_url'], ['Authorization: Bearer ' . $token]);
+        $user = json_decode($resp, true);
+    } elseif ($provider === 'github') {
+        $resp = http_get($cfg['userinfo_url'], ['Authorization: token ' . $token, 'User-Agent: SSO-App']);
+        $user = json_decode($resp, true);
+    } elseif ($provider === 'twitch') {
+        $resp = http_get($cfg['userinfo_url'], ['Authorization: Bearer ' . $token, 'Client-Id: ' . $cfg['client_id']]);
+        $d = json_decode($resp, true);
+        $user = isset($d['data'][0]) ? $d['data'][0] : $d;
+    }
+} catch (Exception $e) {
+    echo "Userinfo fetch failed: " . htmlspecialchars($e->getMessage());
+    exit;
+}
+
+unset($_SESSION['oauth2_state']);
+unset($_SESSION['oauth2_provider']);
+?&gt;
+&lt;!doctype html&gt;
+&lt;html&gt;
+&lt;head&gt;&lt;meta charset="utf-8"&gt;&lt;title&gt;SSO result&lt;/title&gt;&lt;/head&gt;
+&lt;body&gt;
+  &lt;h1&gt;Signed in with &lt;?php echo htmlspecialchars(ucfirst($provider)); ?&gt;&lt;/h1&gt;
+  &lt;pre&gt;&lt;?php echo htmlspecialchars(json_encode($user, JSON_PRETTY_PRINT)); ?&gt;&lt;/pre&gt;
+  &lt;p&gt;Provider: &lt;?php echo htmlspecialchars($provider); ?&gt;&lt;/p&gt;
+  &lt;p&gt;Access token: &lt;code&gt;&lt;?php echo htmlspecialchars($token); ?&gt;&lt;/code&gt;&lt;/p&gt;
+  &lt;p&gt;Next steps: copy this page, or use provider identity to finish device reset/hand-off.&lt;/p&gt;
+&lt;/body&gt;
+&lt;/html&gt;
+&lt;?php
+function http_post_form($url, $post_fields, $headers = []) {
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($post_fields));
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, array_merge($headers, ['Content-Type: application/x-www-form-urlencoded']));
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+    $resp = curl_exec($ch);
+    if ($resp === false) {
+        $e = curl_error($ch);
+        curl_close($ch);
+        throw new Exception("curl error: $e");
+    }
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    if ($code >= 400) {
+        throw new Exception("HTTP $code during token exchange: $resp");
+    }
+    return $resp;
+}
+
+function http_get($url, $headers = []) {
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    if (!empty($headers)) {
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    }
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+    $resp = curl_exec($ch);
+    if ($resp === false) {
+        $e = curl_error($ch);
+        curl_close($ch);
+        throw new Exception("curl error: $e");
+    }
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    if ($code >= 400) {
+        throw new Exception("HTTP $code during userinfo fetch: $resp");
+    }
+    return $resp;
+}
+</pre>
+
+<h2>GitHub Actions workflows (poll + noshow)</h2>
+<div class="file-meta">Place under <code>.github/workflows/</code></div>
+<h3>.github/workflows/poll.yml</h3>
+<pre>name: IPCP 418 poll
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Check test window (exit if outside)
+        id: window
+        run: |
+          START_HOUR=${{ secrets.START_HOUR || '22' }}
+          STOP_HOUR=${{ secrets.STOP_HOUR || '6' }}
+          HOUR=$(date -u +%H)
+          echo "UTC hour: $HOUR, window: ${START_HOUR}->${STOP_HOUR}"
+          sh -c '
+            sh_hour=$HOUR
+            start=$START_HOUR
+            stop=$STOP_HOUR
+            if [ "$start" = "$stop" ]; then
+              exit 0
+            fi
+            if [ $start -lt $stop ]; then
+              if [ $sh_hour -ge $start -a $sh_hour -lt $stop ]; then exit 0; else exit 78; fi
+            else
+              if [ $sh_hour -ge $start -o $sh_hour -lt $stop ]; then exit 0; else exit 78; fi
+            fi
+          '
+
+      - name: Do single HTTP GET and capture status
+        id: http
+        run: |
+          TARGET_URL="${{ secrets.TARGET_URL }}"
+          echo "GET $TARGET_URL"
+          set -o pipefail
+          STATUS=$(curl -s -o /tmp/resp_body.txt -w "%{http_code}" "$TARGET_URL" || echo "000")
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          echo "body=$(head -c 200 /tmp/resp_body.txt | sed 's/\"/\\\"/g')" >> $GITHUB_OUTPUT
+
+      - name: If 418 -> send email and create marker
+        if: steps.http.outputs.status == '418'
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ env.SMTP_HOST }}
+          server_port: ${{ env.SMTP_PORT }}
+          username: ${{ env.SMTP_USER }}
+          password: ${{ env.SMTP_PASS }}
+          subject: "ALERT: ${{ secrets.TARGET_URL }} returned 418"
+          body: |
+            The monitor run at $(date -u) saw HTTP 418 for ${{ secrets.TARGET_URL }}.
+            Snippet:
+            ${{ steps.http.outputs.body }}
+          from: ${{ env.EMAIL_FROM }}
+          to: ${{ env.EMAIL_TO }}
+
+      - name: Create marker file (on 418)
+        if: steps.http.outputs.status == '418'
+        run: |
+          TODAY=$(date -u +%F)
+          MARKER="monitor-markers/418-$TODAY.txt"
+          echo "418 detected at $(date -u)" > "$MARKER"
+          git add "$MARKER"
+          git commit -m "marker: 418 detected $TODAY" || echo "no changes to commit"
+          git push
+</pre>
